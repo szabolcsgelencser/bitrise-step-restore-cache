@@ -8,7 +8,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/bitrise-io/go-steputils/v2/stepconf"
 	"github.com/bitrise-io/go-utils/v2/command"
 	"github.com/bitrise-io/go-utils/v2/env"
 	"github.com/bitrise-io/go-utils/v2/log"
@@ -67,10 +69,15 @@ func NewArchiver(logger log.Logger, envRepo env.Repository, archiveDependencyChe
 }
 
 // Compress creates a compressed archive from the provided files and folders using absolute paths.
-func (a *Archiver) Compress(archivePath string, includePaths []string, compressionLevel int, customTarArgs []string) error {
+func (a *Archiver) Compress(archivePath string, includePaths []string, compressionLevel int, customTarArgs []string, encryptionPass stepconf.Secret) error {
+	// TODO: check if openssl is present if encryption is enabled
 	haveZstdAndTar := a.archiveDependencyChecker.CheckDependencies()
 
 	if !haveZstdAndTar {
+		if len(encryptionPass) > 0 {
+			a.logger.Errorf("zstd and tar must be installed to support encryption.")
+			return errors.New("encryption password is set without zstd and tar installation")
+		}
 		a.logger.Infof("Falling back to native implementation of zstd.")
 		if err := a.compressWithGoLib(archivePath, includePaths, compressionLevel); err != nil {
 			return fmt.Errorf("compress files: %w", err)
@@ -79,16 +86,27 @@ func (a *Archiver) Compress(archivePath string, includePaths []string, compressi
 	}
 
 	a.logger.Infof("Using installed zstd binary")
-	if err := a.compressWithBinary(archivePath, includePaths, compressionLevel, customTarArgs); err != nil {
-		return fmt.Errorf("compress files: %w", err)
+	if len(encryptionPass) > 0 {
+		if err := a.compressWithBinaryEncrypted(archivePath, includePaths, compressionLevel, customTarArgs, encryptionPass); err != nil {
+			return fmt.Errorf("compress files encrypted: %w", err)
+		}
+	} else {
+		if err := a.compressWithBinary(archivePath, includePaths, compressionLevel, customTarArgs); err != nil {
+			return fmt.Errorf("compress files: %w", err)
+		}
 	}
 	return nil
 }
 
 // Decompress takes an archive path and extracts files. This assumes an archive created with absolute file paths.
-func (a *Archiver) Decompress(archivePath string, destinationDirectory string) error {
+func (a *Archiver) Decompress(archivePath string, destinationDirectory string, encryptionPass stepconf.Secret) error {
+	// TODO: check if openssl is present if encryption is enabled
 	haveZstdAndTar := a.archiveDependencyChecker.CheckDependencies()
 	if !haveZstdAndTar {
+		if len(encryptionPass) > 0 {
+			a.logger.Errorf("zstd and tar must be installed to support encryption.")
+			return errors.New("encryption password is set without zstd and tar installation")
+		}
 		a.logger.Infof("Falling back to native implementation of zstd.")
 		if err := a.decompressWithGolib(archivePath, destinationDirectory); err != nil {
 			return fmt.Errorf("decompress files: %w", err)
@@ -97,8 +115,14 @@ func (a *Archiver) Decompress(archivePath string, destinationDirectory string) e
 	}
 
 	a.logger.Infof("Using installed zstd binary")
-	if err := a.decompressWithBinary(archivePath, destinationDirectory); err != nil {
-		return fmt.Errorf("decompress files: %w", err)
+	if len(encryptionPass) > 0 {
+		if err := a.decompressWithBinaryEncrypted(archivePath, destinationDirectory, encryptionPass); err != nil {
+			return fmt.Errorf("decompress encrypted files: %w", err)
+		}
+	} else {
+		if err := a.decompressWithBinary(archivePath, destinationDirectory); err != nil {
+			return fmt.Errorf("decompress files: %w", err)
+		}
 	}
 	return nil
 }
@@ -223,6 +247,51 @@ func (a *Archiver) compressWithBinary(archivePath string, includePaths []string,
 	return nil
 }
 
+func (a *Archiver) compressWithBinaryEncrypted(archivePath string, includePaths []string, compressionLevel int, customTarArgs []string, encryptionPass stepconf.Secret) error {
+	cmdFactory := command.NewFactory(a.envRepo)
+
+	/*
+		tar arguments:
+		-P: Alias for --absolute-paths in BSD tar and --absolute-names in GNU tar (step runs on both Linux and macOS)
+			Storing absolute paths in the archive allows paths outside the current directory (such as ~/.gradle)
+		-c: Create archive
+	*/
+	tarArgs := []string{"tar", "-P", "-c"}
+	tarArgs = append(tarArgs, customTarArgs...)
+	tarArgs = append(tarArgs, includePaths...)
+	tarCmd := strings.Join(tarArgs, " ")
+
+	/*
+		zstd arguments:
+		--threads:0 Use CPU count threads
+		-[level]: compression level (1-19, default 3). Also use --fast if compression level is 1.
+	*/
+	zstdCmd := fmt.Sprintf("zstd --threads=0 -%d", compressionLevel)
+	if compressionLevel == 1 {
+		zstdCmd += " --fast"
+	}
+
+	openSSLCmd := fmt.Sprintf(
+		"openssl enc -aes-256-cbc -salt -pass pass:%s -out %s",
+		encryptionPass, archivePath,
+	)
+
+	cmd := cmdFactory.Create("bash", []string{
+		"-lc",
+		strings.Join([]string{tarCmd, zstdCmd, openSSLCmd}, "|"),
+	}, nil)
+
+	a.logger.Debugf("$ %s", cmd.PrintableCommandArgs())
+
+	out, err := cmd.RunAndReturnTrimmedCombinedOutput()
+	if err != nil {
+		a.logger.Printf("Output: %s", out)
+		return err
+	}
+
+	return nil
+}
+
 func (a *Archiver) decompressWithGolib(archivePath string, destinationDirectory string) error {
 	compressedFile, err := os.OpenFile(archivePath, os.O_RDWR, 0777)
 	if err != nil {
@@ -307,6 +376,49 @@ func (a *Archiver) decompressWithBinary(archivePath string, destinationDirectory
 	}
 
 	cmd := commandFactory.Create("tar", decompressTarArgs, nil)
+	a.logger.Debugf("$ %s", cmd.PrintableCommandArgs())
+
+	out, err := cmd.RunAndReturnTrimmedCombinedOutput()
+	if err != nil {
+		a.logger.Printf("Output: %s", out)
+		return err
+	}
+
+	return nil
+}
+
+func (a *Archiver) decompressWithBinaryEncrypted(archivePath, destinationDirectory string, encryptionPass stepconf.Secret) error {
+	commandFactory := command.NewFactory(a.envRepo)
+
+	openSSLCmd := fmt.Sprintf(
+		"openssl enc -d -aes-256-cbc -salt -pass pass:%s -in %s",
+		encryptionPass, archivePath,
+	)
+
+	/*
+		tar arguments:
+		--use-compress-program: Pipe the input to zstd instead of using the built-in gzip compression
+		-P: Alias for --absolute-paths in BSD tar and --absolute-names in GNU tar (step runs on both Linux and macOS)
+			Storing absolute paths in the archive allows paths outside the current directory (such as ~/.gradle)
+		-x: Extract archive
+		-f: Output file
+	*/
+	decompressTarArgs := []string{
+		"tar",
+		"--use-compress-program", "'zstd -d'",
+		"-x",
+		"-f", archivePath,
+		"-P",
+	}
+	if destinationDirectory != "" {
+		decompressTarArgs = append(decompressTarArgs, "--directory", destinationDirectory)
+	}
+	tarCmd := strings.Join(decompressTarArgs, " ")
+
+	cmd := commandFactory.Create("bash", []string{
+		"-lc",
+		strings.Join([]string{openSSLCmd, tarCmd}, "|"),
+	}, nil)
 	a.logger.Debugf("$ %s", cmd.PrintableCommandArgs())
 
 	out, err := cmd.RunAndReturnTrimmedCombinedOutput()

@@ -12,9 +12,10 @@ import (
 )
 
 type Input struct {
-	Verbose        bool   `env:"verbose,required"`
-	Key            string `env:"key,required"`
-	NumFullRetries int    `env:"retries,required"`
+	Verbose            bool            `env:"verbose,required"`
+	Key                string          `env:"key,required"`
+	NumFullRetries     int             `env:"retries,required"`
+	EncryptionPassword stepconf.Secret `env:"encryption_password"`
 }
 
 type RestoreCacheStep struct {
@@ -52,9 +53,10 @@ func (step RestoreCacheStep) Run() error {
 	step.logger.EnableDebugLog(input.Verbose)
 
 	return cache.NewRestorer(step.envRepo, step.logger, step.commandFactory, nil).Restore(cache.RestoreCacheInput{
-		StepId:         "restore-cache",
-		Verbose:        input.Verbose,
-		Keys:           strings.Split(input.Key, "\n"),
-		NumFullRetries: input.NumFullRetries,
+		StepId:             "restore-cache",
+		Verbose:            input.Verbose,
+		Keys:               strings.Split(input.Key, "\n"),
+		NumFullRetries:     input.NumFullRetries,
+		EncryptionPassword: input.EncryptionPassword,
 	})
 }

@@ -112,6 +112,12 @@ inputs:
       The value 0 means no retries are attempted.
     is_required: true
 
+- encryption_password:
+  opts:
+    title: Encryption password
+    summary: The password used to generate the encryption key for AES-256-CBC encryption.
+    description: The password used to generate the encryption key for AES-256-CBC encryption.
+
 outputs:
 - BITRISE_CACHE_HIT:
   opts:
